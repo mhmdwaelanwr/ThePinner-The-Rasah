@@ -8,22 +8,86 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 DATA_FILE = os.path.join(os.path.expanduser("~"), ".pinner_data.json")
+MAX_IMPORTED_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _default_data():
+    return {"lists": {}}
+
+
+def _normalize_item(item):
+    if not isinstance(item, dict):
+        return None
+
+    item_type = item.get("type", "text")
+    if item_type not in {"text", "image"}:
+        return None
+
+    content = item.get("content", "")
+    label = item.get("label", "")
+    if not isinstance(content, str) or not isinstance(label, str):
+        return None
+
+    return {"type": item_type, "content": content, "label": label}
+
+
+def _normalize_data(data):
+    if not isinstance(data, dict):
+        return _default_data()
+
+    lists = data.get("lists", {})
+    if not isinstance(lists, dict):
+        return _default_data()
+
+    normalized_lists = {}
+    for name, items in lists.items():
+        if not isinstance(name, str) or not isinstance(items, list):
+            continue
+
+        normalized_items = []
+        for item in items:
+            normalized_item = _normalize_item(item)
+            if normalized_item is not None:
+                normalized_items.append(normalized_item)
+        normalized_lists[name] = normalized_items
+
+    return {"lists": normalized_lists}
+
+
+def _safe_json_load(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _normalize_data(json.load(f))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return _default_data()
+
+
+def _atomic_json_write(path, data):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".pinner-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(_normalize_data(data), f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 def load_data():
     if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"lists": {}}
+        return _safe_json_load(DATA_FILE)
+    return _default_data()
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    _atomic_json_write(DATA_FILE, data)
 
 def copy_image_to_clipboard(pil_image):
     """Copy PIL image to Windows clipboard so Win+V catches it."""
+    temp_path = None
     try:
         if sys.platform == "win32":
             import win32clipboard
@@ -40,16 +104,23 @@ def copy_image_to_clipboard(pil_image):
         else:
             # Mac / Linux fallback — save temp file
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            pil_image.save(tmp.name)
+            temp_path = tmp.name
             tmp.close()
+            pil_image.save(temp_path)
             if sys.platform == "darwin":
                 subprocess.run(["osascript", "-e",
-                    f'set the clipboard to (read (POSIX file "{tmp.name}") as TIFF picture)'])
+                    f'set the clipboard to (read (POSIX file "{temp_path}") as TIFF picture)'], check=False)
             return True
     except ImportError:
         return False
     except Exception:
         return False
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 class PinnerApp(ctk.CTk):
     def __init__(self):
@@ -235,12 +306,13 @@ class PinnerApp(ctk.CTk):
             try:
                 img_data = base64.b64decode(item["content"])
                 img = Image.open(io.BytesIO(img_data))
+                img.load()
                 img.thumbnail((420, 280))
                 photo = ImageTk.PhotoImage(img)
                 lbl = tk.Label(card, image=photo, bg="#16162a")
                 lbl.image = photo
                 lbl.grid(row=1, column=0, padx=10, pady=(0,10), sticky="w")
-            except Exception:
+            except (OSError, ValueError, base64.binascii.Error):
                 ctk.CTkLabel(card, text="[خطأ في الصورة]",
                              text_color="#ff6666").grid(row=1,column=0,padx=10,pady=6)
         else:
@@ -271,12 +343,19 @@ class PinnerApp(ctk.CTk):
             filetypes=[("صور","*.png *.jpg *.jpeg *.gif *.bmp *.webp")])
         if not path:
             return
-        with open(path,"rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        self.data["lists"][self.current_list].append(
-            {"type":"image","content":b64,"label":os.path.basename(path)})
-        save_data(self.data)
-        self._render_items()
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            if len(raw) > MAX_IMPORTED_IMAGE_BYTES:
+                messagebox.showwarning("تنبيه", "حجم الصورة كبير جدًا.")
+                return
+            b64 = base64.b64encode(raw).decode()
+            self.data["lists"][self.current_list].append(
+                {"type":"image","content":b64,"label":os.path.basename(path)})
+            save_data(self.data)
+            self._render_items()
+        except OSError as e:
+            messagebox.showerror("خطأ", f"مش قادر يقرأ الصورة:\n{e}")
 
     # ── Text editor with full paste support ───────────────────────────────────
     def _text_editor(self, item, idx=None):
@@ -377,6 +456,7 @@ class PinnerApp(ctk.CTk):
         try:
             img_data = base64.b64decode(item["content"])
             img = Image.open(io.BytesIO(img_data))
+            img.load()
             ok = copy_image_to_clipboard(img)
             if ok:
                 self._toast("✅ الصورة اتنسخت!")
@@ -444,6 +524,12 @@ class PinnerApp(ctk.CTk):
                 imp = json.load(f)
             name = imp.get("list_name", os.path.basename(path).replace(".pinner",""))
             items = imp.get("items",[])
+            normalized = _normalize_data({"lists": {name: items}})
+            if normalized["lists"]:
+                name = next(iter(normalized["lists"]))
+                items = normalized["lists"][name]
+            else:
+                items = []
             if name in self.data["lists"]:
                 if not messagebox.askyesno("استيراد",f'القائمة "{name}" موجودة. هتستبدلها؟'):
                     return
@@ -452,7 +538,7 @@ class PinnerApp(ctk.CTk):
             self._refresh_lists()
             self._open_list(name)
             self._toast("📥 اتستورد!")
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ValueError) as e:
             messagebox.showerror("خطأ",f"مش قدر يستورد:\n{e}")
 
 
