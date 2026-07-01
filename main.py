@@ -344,11 +344,11 @@ class PinnerApp(ctk.CTk):
         if not path:
             return
         try:
-            with open(path, "rb") as f:
-                raw = f.read()
-            if len(raw) > MAX_IMPORTED_IMAGE_BYTES:
+            if os.path.getsize(path) > MAX_IMPORTED_IMAGE_BYTES:
                 messagebox.showwarning("تنبيه", "حجم الصورة كبير جدًا.")
                 return
+            with open(path, "rb") as f:
+                raw = f.read()
             b64 = base64.b64encode(raw).decode()
             self.data["lists"][self.current_list].append(
                 {"type":"image","content":b64,"label":os.path.basename(path)})
